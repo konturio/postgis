@@ -383,6 +383,7 @@ LWCOLLECTION* partial_union(LWCOLLECTION* col, float8 gridSize)
             if (i - j > 1)
             {
                 LWCOLLECTION *aux;
+                LWGEOM *merged;
                 POSTGIS_DEBUGF(1, "    (merging %d geoms)", i - j);
 
                 /* Create union */
@@ -392,7 +393,7 @@ LWCOLLECTION* partial_union(LWCOLLECTION* col, float8 gridSize)
                     NULL,
                     i - j,
                     &col->geoms[j]);
-                LWGEOM *merged = lwgeom_unaryunion_prec(lwcollection_as_lwgeom(aux), gridSize);
+                merged = lwgeom_unaryunion_prec(lwcollection_as_lwgeom(aux), gridSize);
                 lwcollection_release(aux);
 
                 /* Append to result */
