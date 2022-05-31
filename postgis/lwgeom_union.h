@@ -7,9 +7,9 @@
 
 typedef struct UnionState
 {
-    LWCOLLECTION *geoms;
     float8 gridSize;
-    bool isMerged;
+    List *list;
+    int32 size;
 } UnionState;
 
 #endif

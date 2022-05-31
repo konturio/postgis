@@ -17,7 +17,6 @@
  * TODO:
  * * investigate memory management, aggregate context
  *   - no context switch in finalfn? (see pgis_asmvt_finalfn)
- * * why List is used in lwgeom_accum.c instead of LWCOLLECTION?
  */
 
 #define GetAggContext(aggcontext) \
@@ -33,19 +32,18 @@
 Datum pgis_test_geometry_union_transfn(PG_FUNCTION_ARGS);
 Datum pgis_test_geometry_union_combinefn(PG_FUNCTION_ARGS);
 Datum pgis_test_geometry_union_serialfn(PG_FUNCTION_ARGS);
-Datum pgis_test_geometry_union_deserialfn(PG_FUNCTION_ARGS);
+Datum pgis_test_geometry_union_deeserialfn(PG_FUNCTION_ARGS);
 Datum pgis_test_geometry_union_finalfn(PG_FUNCTION_ARGS);
 
 static UnionState* state_create(void);
-static void state_init(UnionState *state);
-static void state_append(UnionState *state, const LWGEOM *geom);
-static bytea* state_serialize(UnionState *state);
-static UnionState* state_deserialize(bytea* serialized);
-static void state_merge(UnionState *state1, UnionState *state2);
+static void state_append(UnionState *state, const GSERIALIZED *gser);
+static bytea* state_serialize(const UnionState *state);
+static UnionState* state_deserialize(const bytea* serialized);
+static void state_combine(UnionState *state1, UnionState *state2);
+static int state_geom_num(const UnionState *state);
 
-static LWCOLLECTION* partial_union(LWCOLLECTION* col, float8 gridSize);
-static void sort_geoms(LWCOLLECTION* col);
-static int geom_cmp(const void* g1, const void* g2);
+static LWCOLLECTION* lwcollection_from_gserialized_list(List* list);
+
 
 PG_FUNCTION_INFO_V1(pgis_test_geometry_union_transfn);
 Datum pgis_test_geometry_union_transfn(PG_FUNCTION_ARGS)
@@ -86,15 +84,10 @@ Datum pgis_test_geometry_union_transfn(PG_FUNCTION_ARGS)
             state->gridSize = gridSize;
     }
 
-    /* Copy geometry into state */
+    /* Copy serialized geometry into state */
     if (gser) {
-        LWGEOM *geom;
         old = MemoryContextSwitchTo(aggcontext);
-
-        geom = lwgeom_from_gserialized(gser);
-        state_append(state, lwgeom_clone_deep(geom));
-        lwgeom_free(geom);
-
+        state_append(state, gser);
         MemoryContextSwitchTo(old);
     }
 
@@ -114,17 +107,17 @@ Datum pgis_test_geometry_union_combinefn(PG_FUNCTION_ARGS)
     state1 = (UnionState*) PG_GETARG_POINTER(0);
     state2 = (UnionState*) PG_GETARG_POINTER(1);
 
-    POSTGIS_DEBUGF(1, "  # of geoms: %d", (state1 && state1->geoms) ? state1->geoms->ngeoms : 0);
-    POSTGIS_DEBUGF(1, "  # of geoms: %d", (state2 && state2->geoms) ? state2->geoms->ngeoms : 0);
+    POSTGIS_DEBUGF(1, "  # of geoms: %d", state_geom_num(state1));
+    POSTGIS_DEBUGF(1, "  # of geoms: %d", state_geom_num(state2));
 
     GetAggContext(&aggcontext);
     old = MemoryContextSwitchTo(aggcontext);
 
-    /* Merge states */
-    if (state1 && state2) {
-        state_merge(state1, state2);
+    /* Combine states */
+    if (state1 && state2)
+    {
+        state_combine(state1, state2);
         lwfree(state2);
-        state2 = NULL;
     }
     else if (state2)
     {
@@ -132,10 +125,6 @@ Datum pgis_test_geometry_union_combinefn(PG_FUNCTION_ARGS)
     }
 
     MemoryContextSwitchTo(old);
-
-    /* Mark result as merged */
-    if (state1)
-        state1->isMerged = true;
 
     PG_RETURN_POINTER(state1);
 }
@@ -146,19 +135,21 @@ Datum pgis_test_geometry_union_serialfn(PG_FUNCTION_ARGS)
 {
     MemoryContext aggcontext = NULL, old;
     UnionState *state;
-    bytea *serialized;
+    bytea *serialized = NULL;
 
     POSTGIS_DEBUG(1, "pgis_test_geometry_union_serialfn");
 
     GetAggContext(&aggcontext);
     old = MemoryContextSwitchTo(aggcontext);
 
-    /* TODO: don't create new state, just pass NULL */
     if (!PG_ARGISNULL(0))
+    {
         state = (UnionState*) PG_GETARG_POINTER(0);
+    }
     else
+    {
         state = state_create();
-
+    }
     serialized = state_serialize(state);
 
     MemoryContextSwitchTo(old);
@@ -184,7 +175,6 @@ Datum pgis_test_geometry_union_deserialfn(PG_FUNCTION_ARGS)
     old = MemoryContextSwitchTo(aggcontext);
 
     state = state_deserialize(serialized);
-    state->isMerged = true;
 
     MemoryContextSwitchTo(old);
 
@@ -196,9 +186,10 @@ PG_FUNCTION_INFO_V1(pgis_test_geometry_union_finalfn);
 Datum pgis_test_geometry_union_finalfn(PG_FUNCTION_ARGS)
 {
     MemoryContext aggcontext = NULL, old;
-    UnionState *state = NULL;
-    GSERIALIZED* result = NULL;
-    LWGEOM* geom;
+    UnionState *state;
+    LWCOLLECTION *col;
+    GSERIALIZED *result;
+    LWGEOM *geom;
 
     POSTGIS_DEBUG(1, "pgis_test_geometry_union_finalfn");
 
@@ -206,20 +197,21 @@ Datum pgis_test_geometry_union_finalfn(PG_FUNCTION_ARGS)
         ErrorInvalidParam("Empty state value");
     state = (UnionState*)PG_GETARG_POINTER(0);
 
-    POSTGIS_DEBUGF(1, "  # of geoms: %d", (state && state->geoms) ? state->geoms->ngeoms : 0);
-
-    /* TODO: return empty_type, see lwgeom_geos.c */
-    if (!state->geoms)
-        PG_RETURN_NULL();
+    POSTGIS_DEBUGF(1, "  # of geoms: %d", state_geom_num(state));
+    POSTGIS_DEBUGF(1, " grid size: %f", (float) state->gridSize);
 
     GetAggContext(&aggcontext);
     old = MemoryContextSwitchTo(aggcontext);
 
-    POSTGIS_DEBUGF(1, " grid size: %f", (float) state->gridSize);
+    col = lwcollection_from_gserialized_list(state->list);
+    geom = lwgeom_unaryunion_prec(lwcollection_as_lwgeom(col), state->gridSize);
+    if (geom)
+    {
+        result = geometry_serialize(geom);
+        lwgeom_free(geom);
+    }
 
-    geom = lwgeom_unaryunion_prec(lwcollection_as_lwgeom(state->geoms), state->gridSize);
-    result = geometry_serialize(geom);
-    lwgeom_free(geom);
+    /* TODO: clean list and collection immetiately? */
 
     MemoryContextSwitchTo(old);
 
@@ -230,53 +222,33 @@ Datum pgis_test_geometry_union_finalfn(PG_FUNCTION_ARGS)
 UnionState* state_create(void)
 {
     UnionState *state = lwalloc(sizeof(UnionState));
-    state_init(state);
+    state->gridSize = -1.0;
+    state->list = NIL;
+    state->size = 0;
     return state;
 }
 
 
-void state_init(UnionState *state)
+void state_append(UnionState *state, const GSERIALIZED *gser)
 {
-    state->geoms = NULL;
-    state->gridSize = -1.0;
-    state->isMerged = false;
+    GSERIALIZED *gser_copy;
+
+    assert(gser);
+    gser_copy = lwalloc(VARSIZE(gser));
+    memcpy(gser_copy, gser, VARSIZE(gser));
+
+    state->list = lappend(state->list, gser_copy);
+    state->size += VARSIZE(gser);
 }
 
 
-void state_append(UnionState *state, const LWGEOM *geom)
+bytea* state_serialize(const UnionState *state)
 {
-    if (!state->geoms)
-    {
-        int32_t srid = lwgeom_get_srid(geom);
-        int hasz = FLAGS_GET_Z(geom->flags);
-        int hasm = FLAGS_GET_M(geom->flags);
-        state->geoms = lwcollection_construct_empty(COLLECTIONTYPE, srid, hasz, hasm);
-    }
-
-    state->geoms = lwcollection_add_lwgeom(state->geoms, geom);
-}
-
-
-bytea* state_serialize(UnionState *state)
-{
-    GSERIALIZED *serialized_geoms = NULL;
-    bytea *serialized;
+    int32 size = VARHDRSZ + sizeof(state->gridSize) + state->size;
+    bytea *serialized = lwalloc(size);
     uint8 *data;
-    int32 size = VARHDRSZ + sizeof(state->gridSize);
+    ListCell *cell;
 
-    if (state->geoms)
-    {
-        if (!state->isMerged)
-        {
-            sort_geoms(state->geoms);
-            state->geoms = partial_union(state->geoms, state->gridSize);
-        }
-
-        serialized_geoms = geometry_serialize(lwcollection_as_lwgeom(state->geoms));
-        size += VARSIZE(serialized_geoms);
-    }
-
-    serialized = lwalloc(size);
     SET_VARSIZE(serialized, size);
     data = (uint8*)VARDATA(serialized);
 
@@ -284,183 +256,100 @@ bytea* state_serialize(UnionState *state)
     memcpy(data, &state->gridSize, sizeof(state->gridSize));
     data += sizeof(state->gridSize);
 
-    /* geometry collection */
-    if (serialized_geoms)
+    /* items */
+    foreach (cell, state->list)
     {
-        memcpy(data, serialized_geoms, VARSIZE(serialized_geoms));
-        lwfree(serialized_geoms);
+        const GSERIALIZED *gser = (const GSERIALIZED*)lfirst(cell);
+        assert(gser);
+        memcpy(data, gser, VARSIZE(gser));
+        data += VARSIZE(gser);
     }
 
     return serialized;
 }
 
 
-UnionState* state_deserialize(bytea* serialized)
+UnionState* state_deserialize(const bytea* serialized)
 {
     UnionState *state = state_create();
-    uint8 *data = (uint8*)VARDATA(serialized);
+    const uint8 *data = (const uint8*)VARDATA(serialized);
+    const uint8 *data_end = (const uint8*)serialized + VARSIZE(serialized);
 
     /* grid size */
     memcpy(&state->gridSize, data, sizeof(state->gridSize));
     data += sizeof(state->gridSize);
 
-    /* geometry collection */
-    if (VARSIZE(serialized) - VARHDRSZ > sizeof(state->gridSize))
+    /* items */
+    while (data < data_end)
     {
-        GSERIALIZED *serialized_geoms;
-        LWGEOM *geom;
-
-        assert(VARSIZE(serialized) > VARHDRSZ * 2 + sizeof(state->gridSize));
-
-        /* Deserialize */
-        serialized_geoms = (GSERIALIZED*)data;
-        geom = lwgeom_from_gserialized(serialized_geoms);
-
-        /* Copy collection */
-        state->geoms = lwgeom_as_lwcollection(lwgeom_clone_deep(geom));
-
-        /* Cleanup */
-        lwgeom_release(geom);
-
-        assert(state->geoms);
+        const GSERIALIZED* gser = (const GSERIALIZED*)data;
+        state_append(state, gser);
+        data += VARSIZE(gser);
     }
 
     return state;
 }
 
 
-void state_merge(UnionState *state1, UnionState *state2)
+void state_combine(UnionState *state1, UnionState *state2)
 {
-    LWCOLLECTION *geoms1 = state1->geoms;
-    LWCOLLECTION *geoms2 = state2->geoms;
+    List *list1 = state1->list;
+    List *list2 = state2->list;
 
-    if (geoms1 && geoms2)
+    if (list1 != NIL && list2 != NIL)
     {
-        state1->geoms = lwcollection_concat_in_place(geoms1, geoms2);
-        lwcollection_release(state2->geoms);
+        state1->list = list_concat(list1, list2);
+        list_free(list2);
     }
-    else
+    else if (list2 != NIL)
     {
-        state1->geoms = geoms1 ? geoms1 : geoms2;
+        state1->list = list2;
     }
-
-    state2->geoms = NULL;
+    state2->list = NIL;
 }
 
 
-/* NOTE: original collection will be released */
-LWCOLLECTION* partial_union(LWCOLLECTION* col, float8 gridSize)
+int state_geom_num(const UnionState *state)
 {
-    LWCOLLECTION *result = NULL;
-    uint32_t j = 0; /* start index of sequence of geoms with overlapping boxes */
-    GBOX *bbox = NULL; /* merged bbox */
+    if (!state) return -1;
+    return (state->list != NIL) ? state->list->length : 0;
+}
 
-    /* TODO: add unique identifier */
-    POSTGIS_DEBUG(1, "  partial_union");
-    POSTGIS_DEBUGF(1, "    # of geoms: %d", col->ngeoms);
 
-    result = lwcollection_construct_empty(
-        col->type,
-        col->srid,
-        FLAGS_GET_Z(col->flags),
-        FLAGS_GET_M(col->flags));
+LWCOLLECTION* lwcollection_from_gserialized_list(List* list)
+{
+    int ngeoms;
+    LWGEOM **geoms;
+    int32_t srid;
+    ListCell *cell;
+    int i;
 
-    for (uint32_t i = 0; i < col->ngeoms + 1; ++i) {
-        LWGEOM *cur = NULL;
-        const GBOX *cur_bbox = NULL;
+    if (list == NIL)
+        return NULL;
 
-        /* Get current geom */
-        if (i < col->ngeoms)
-        {
-            cur = col->geoms[i];
-            cur_bbox = lwgeom_get_bbox(cur); /* can be NULL for empty LWGEOM */
-        }
+    ngeoms = list->length;
+    assert(ngeoms > 0);
 
-        /* NOTE: merging empty geoms */
-        if (i > 0 && (!cur || (bbox && cur_bbox && !gbox_overlaps(bbox, cur_bbox))))
-        {
-            /* Add sequence union to result */
-            if (i - j > 1)
-            {
-                LWCOLLECTION *aux;
-                LWGEOM *merged;
-                POSTGIS_DEBUGF(1, "    (merging %d geoms)", i - j);
+    geoms = lwalloc(ngeoms * sizeof(LWGEOM*));
+    srid = SRID_UNKNOWN;
+    i = 0;
+    foreach (cell, list)
+    {
+        int32_t geom_srid;
+        GSERIALIZED *gser;
+        LWGEOM *geom;
 
-                /* Create union */
-                aux = lwcollection_construct(
-                    col->type,
-                    col->srid,
-                    NULL,
-                    i - j,
-                    &col->geoms[j]);
-                merged = lwgeom_unaryunion_prec(lwcollection_as_lwgeom(aux), gridSize);
-                lwcollection_release(aux);
+        gser = (GSERIALIZED*)lfirst(cell);
+        assert(gser);
+        geom = lwgeom_from_gserialized(gser);
 
-                /* Append to result */
-                if (lwgeom_is_collection(merged))
-                    result = lwcollection_concat_in_place(result, lwgeom_as_lwcollection(merged));
-                else
-                    result = lwcollection_add_lwgeom(result, merged);
+        geom_srid = lwgeom_get_srid(geom);
+        if (srid == SRID_UNKNOWN && geom_srid != SRID_UNKNOWN)
+            srid = geom_srid;
 
-                /* Free used geoms */
-                for (uint32_t k = j; k < i; ++k) {
-                    lwgeom_free(col->geoms[k]);
-                    col->geoms[k] = NULL;
-                }
-            }
-            else
-            {
-                result = lwcollection_add_lwgeom(result, col->geoms[j]);
-            }
-
-            if (cur)
-            {
-                /* Start next sequence */
-                j = i;
-                bbox = cur_bbox ? gbox_copy(cur_bbox) : NULL;
-            }
-        }
-        else if (cur && cur_bbox)
-        {
-            /* Init or update bbox for current sequence */
-            if (bbox)
-                gbox_merge(cur_bbox, bbox);
-            else
-                bbox = gbox_copy(cur_bbox);
-        }
+        geoms[i++] = geom; /* no cloning */
     }
+    assert(i == ngeoms);
 
-    POSTGIS_DEBUGF(1, "    # of geoms after union: %d", result->ngeoms);
-
-    lwcollection_release(col);
-    return result;
-}
-
-
-void sort_geoms(LWCOLLECTION* col)
-{
-    qsort(col->geoms, col->ngeoms, sizeof(LWGEOM*), &geom_cmp);
-}
-
-
-int geom_cmp(const void *_g1, const void *_g2)
-{
-    const LWGEOM *g1 = _g1;
-    const LWGEOM *g2 = _g2;
-    const GBOX *bbox1 = lwgeom_get_bbox(g1);
-    const GBOX *bbox2 = lwgeom_get_bbox(g2);
-    uint64_t hash1, hash2;
-
-    /* Ignore empty boxes */
-    if (!bbox1 || !bbox2)
-        return 0;
-
-    hash1 = gbox_get_sortable_hash(bbox1, g1->srid);
-    hash2 = gbox_get_sortable_hash(bbox2, g2->srid);
-
-    if (hash1 > hash2)
-        return 1;
-    if (hash1 < hash2)
-        return -1;
-    return 0;
+    return lwcollection_construct(COLLECTIONTYPE, srid, NULL, ngeoms, geoms);
 }
